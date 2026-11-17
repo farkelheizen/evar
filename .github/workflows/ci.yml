@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Zsh syntax
+        run: |
+          zsh -n evar
+          zsh -n tests/lib.zsh
+          zsh -n tests/test-cli.zsh
+          zsh -n tests/test-validation.zsh
+      - name: Check whitespace
+        run: git diff --check
+      - name: Run CLI tests
+        run: zsh tests/test-cli.zsh
+      - name: Run validation tests
+        run: zsh tests/test-validation.zsh

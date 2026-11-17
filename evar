@@ -1,0 +1,1018 @@
+#!/bin/zsh
+
+emulate -L zsh
+setopt no_unset pipe_fail
+unsetopt err_exit
+# Byte-oriented, deterministic behavior: sort order and pattern matching must
+# not depend on the caller's locale. UTF-8 is validated explicitly.
+export LC_ALL=C
+umask 077
+
+readonly EVAR_VERSION=0.1.0-dev
+
+typeset -g OPT_NO_NEWLINE=0 OPT_FORCE=0 OPT_STDIN=0
+typeset -ga ARGS
+typeset -ga EVAR_TEMP_FILES
+
+# ---- Errors ----------------------------------------------------------------
+# Exit codes: 1 usage/identifier/missing, 2 value validation, 3 filesystem.
+# These call exit, so never invoke them inside $(...) or the left side of a
+# pipeline: they would only end that subshell.
+
+fail() {
+  local code=$1
+  shift
+  print -u2 -r -- "evar: $*"
+  exit "$code"
+}
+
+usage_fail() { fail 1 "$@" }
+value_fail() { fail 2 "$@" }
+io_fail() { fail 3 "$@" }
+
+cleanup_temp_files() {
+  local file
+  for file in "${EVAR_TEMP_FILES[@]}"; do
+    [[ -n $file ]] && /bin/rm -f -- "$file"
+  done
+  EVAR_TEMP_FILES=()
+}
+
+# ---- Output ----------------------------------------------------------------
+# zsh's print returns 0 even when the write fails (closed descriptor, full
+# disk), so data goes through syswrite from zsh's own zsh/system module, which
+# reports failures. If the module is somehow unavailable, print is the
+# fallback and write errors can then go unnoticed.
+
+# emit <text>: write the bytes of <text> to standard output; returns 1 if the
+# write fails. Redirect it to write elsewhere. Never exits.
+emit() {
+  local data=$1
+  local -i written
+  (( ${+builtins[syswrite]} )) || zmodload -F zsh/system b:syswrite 2> /dev/null
+  if (( ${+builtins[syswrite]} )); then
+    while [[ -n $data ]]; do
+      syswrite -c written -o 1 -- "$data" 2> /dev/null || return 1
+      (( written > 0 )) || return 1
+      data=${data[written+1,-1]}
+    done
+  else
+    print -rn -- "$data"
+  fi
+}
+
+# out <text> / out_line <text>: emit to standard output (out_line appends a
+# newline), or exit 3 if the write fails.
+out() {
+  emit "$1" || io_fail "cannot write to standard output"
+}
+
+out_line() {
+  emit "$1"$'\n' || io_fail "cannot write to standard output"
+}
+
+# ---- Help ------------------------------------------------------------------
+
+usage() {
+  out_line 'Usage: evar <command> [options] [--] [arguments]
+
+evar stores non-secret environment variable values in a local registry: one
+plain-text file per variable under <org>/<module>/<version>. Values are data;
+evar never evaluates them as shell code. Do not store secrets.
+
+Commands:
+  get [-n|--no-newline] <scope> <VAR>   Print a value
+  set <scope> <VAR> <VALUE>             Store a single-line value
+  set <scope> <VAR> --stdin             Store one line read from stdin
+  unset [-f|--force] <scope> <VAR>      Delete a variable
+  exists <scope> [<VAR>]                Test for a variable or a non-empty scope
+  list [<org>[/<module>[/<version>]]]   List scopes, or VAR=VALUE pairs
+  help, -h, --help                      Show this help
+  --version, -V                         Show the version
+
+<scope> is <org>/<module>[/<version>]. An omitted version means the default
+slot "_". Options may appear anywhere before "--"; put "--" before a value
+that begins with "-". Run "evar <command> --help" for details.
+
+Names (matched exactly, including case):
+  org, module, version  1-64 of A-Z a-z 0-9 . _ -, starting with a letter or
+                        digit, not ending in "."; version may also be "_"
+  VAR                   1-128 of A-Z a-z 0-9 _, not starting with a digit
+  Windows device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with or without
+  an extension) are reserved. Names that differ only by case cannot coexist.
+
+Exit status:
+  0  success
+  1  usage error, invalid identifier, or missing scope/variable
+  2  invalid value (not single-line UTF-8 without NUL), when writing or when
+     a stored file is corrupt
+  3  filesystem error or unsafe registry entry (symlink, wrong file type)
+
+Environment:
+  EVAR_HOME  absolute registry root; default is
+             ${XDG_CONFIG_HOME:-$HOME/.config}/evar/registry'
+}
+
+usage_cmd() {
+  case $1 in
+    get)
+      out_line 'Usage: evar get [-n|--no-newline] [--] <org>/<module>[/<version>] <VAR>
+
+Print the value of VAR followed by a newline (none with -n). Exits 1 if the
+scope or variable does not exist, 2 if the stored file is corrupt (embedded
+line break, NUL, invalid UTF-8), 3 on an unsafe or unreadable entry.'
+      ;;
+    set)
+      out_line 'Usage: evar set [--] <org>/<module>[/<version>] <VAR> <VALUE>
+       evar set <org>/<module>[/<version>] <VAR> --stdin
+
+Store a single-line UTF-8 value, replacing any existing value. With --stdin,
+read exactly one line (ended by LF, CRLF, or end of input); empty input and
+multi-line input are rejected. A value beginning with "-" needs "--".
+Note: a VALUE argument is visible in process listings and shell history.'
+      ;;
+    unset)
+      out_line 'Usage: evar unset [-f|--force] [--] <org>/<module>[/<version>] <VAR>
+
+Delete VAR and prune directories left empty. Exits 1 if VAR does not exist,
+unless -f is given.'
+      ;;
+    exists)
+      out_line 'Usage: evar exists [--] <org>/<module>[/<version>] [<VAR>]
+
+Print nothing; exit 0 if VAR exists, or (without VAR) if the scope holds at
+least one variable. Exits 1 if not found, 3 on an unsafe or unreadable entry.
+Values are not read or validated.'
+      ;;
+    list)
+      out_line 'Usage: evar list [--] [<org>[/<module>[/<version>]]]
+
+With no argument, or <org> or <org>/<module>, print every scope that holds a
+variable as org/module/version (the default slot is shown as "_"), sorted
+bytewise as whole lines. With <org>/<module>/<version>, print NAME=VALUE
+lines sorted by variable name; nothing is printed if any value is invalid.
+No argument on an empty registry succeeds with no output; an explicit
+argument that matches nothing exits 1.'
+      ;;
+  esac
+}
+
+# ---- Option parsing --------------------------------------------------------
+
+# parse_args <command> <allowed options> [args...]
+# Allowed options are space-separated long names: no-newline force stdin.
+# Options (and -h/--help) may appear anywhere before a literal "--"; everything
+# after "--" is positional. Sets OPT_* and ARGS.
+parse_args() {
+  local cmd=$1 allowed=" $2 "
+  shift 2
+  ARGS=()
+  OPT_NO_NEWLINE=0 OPT_FORCE=0 OPT_STDIN=0
+  while (( $# )); do
+    case $1 in
+      --)
+        shift
+        ARGS+=("$@")
+        return 0
+        ;;
+      -h|--help)
+        usage_cmd "$cmd"
+        exit 0
+        ;;
+      -n|--no-newline)
+        [[ $allowed == *' no-newline '* ]] || usage_fail "unknown option ${(qq)1} for '$cmd'; use --help"
+        OPT_NO_NEWLINE=1
+        ;;
+      -f|--force)
+        [[ $allowed == *' force '* ]] || usage_fail "unknown option ${(qq)1} for '$cmd'; use --help"
+        OPT_FORCE=1
+        ;;
+      --stdin)
+        [[ $allowed == *' stdin '* ]] || usage_fail "unknown option ${(qq)1} for '$cmd'; use --help"
+        OPT_STDIN=1
+        ;;
+      -?*)
+        usage_fail "unknown option ${(qq)1} for '$cmd'; use --help"
+        ;;
+      *)
+        ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
+# ---- Identifier validation -------------------------------------------------
+# These tighten the draft's regexes for cross-OS portability (plan D5): no
+# trailing "." (Windows strips it, so "acme." would alias "acme") and no
+# Windows device names (checked on the stem before the first ".").
+
+readonly ID_RULE="use 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit, not ending in '.', and not a reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)"
+readonly VAR_RULE="use 1-128 letters, digits or '_', not starting with a digit, and not a reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)"
+
+is_reserved_device_stem() {
+  local stem=${1%%.*}
+  stem=${(U)stem}
+  [[ $stem == (CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) ]]
+}
+
+# org and module names.
+valid_org_like() {
+  local re='^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$'
+  [[ $1 =~ $re ]] || return 1
+  [[ $1 != *. ]] || return 1
+  ! is_reserved_device_stem "$1"
+}
+
+valid_version() {
+  [[ $1 == _ ]] || valid_org_like "$1"
+}
+
+valid_variable() {
+  local re='^[a-zA-Z_][a-zA-Z0-9_]{0,127}$'
+  [[ $1 =~ $re ]] || return 1
+  ! is_reserved_device_stem "$1"
+}
+
+require_variable() {
+  valid_variable "$1" || usage_fail "invalid variable name ${(qq)1}: $VAR_RULE"
+}
+
+# ---- Scope parsing ---------------------------------------------------------
+# Pure string work; nothing here touches the filesystem.
+
+typeset -g SCOPE_ORG='' SCOPE_MODULE='' SCOPE_VERSION='' SCOPE_DEPTH=0
+typeset -ga SCOPE_PARTS
+
+# split_scope <scope> <min> <max>: structural checks, fills SCOPE_PARTS.
+split_scope() {
+  local scope=$1 min=$2 max=$3
+  [[ -n $scope ]] || usage_fail "empty scope; expected <org>/<module>[/<version>]"
+  [[ $scope != /* && $scope != */ && $scope != *//* ]] ||
+    usage_fail "invalid scope ${(qq)scope}: empty path segment"
+  SCOPE_PARTS=("${(@s:/:)scope}")
+  (( ${#SCOPE_PARTS} <= max )) ||
+    usage_fail "invalid scope ${(qq)scope}: at most 3 segments (<org>/<module>/<version>)"
+  (( ${#SCOPE_PARTS} >= min )) ||
+    usage_fail "invalid scope ${(qq)scope}: expected <org>/<module>[/<version>]"
+}
+
+validate_scope_parts() {
+  valid_org_like "$SCOPE_PARTS[1]" || usage_fail "invalid org ${(qq)SCOPE_PARTS[1]}: $ID_RULE"
+  if (( ${#SCOPE_PARTS} >= 2 )); then
+    valid_org_like "$SCOPE_PARTS[2]" || usage_fail "invalid module ${(qq)SCOPE_PARTS[2]}: $ID_RULE"
+  fi
+  if (( ${#SCOPE_PARTS} >= 3 )); then
+    valid_version "$SCOPE_PARTS[3]" || usage_fail "invalid version ${(qq)SCOPE_PARTS[3]}: use '_' or $ID_RULE"
+  fi
+}
+
+# parse_scope <org>/<module>[/<version>]: sets SCOPE_ORG/MODULE/VERSION; an
+# omitted version is the default slot "_".
+parse_scope() {
+  split_scope "$1" 2 3
+  validate_scope_parts
+  SCOPE_DEPTH=${#SCOPE_PARTS}
+  SCOPE_ORG=$SCOPE_PARTS[1]
+  SCOPE_MODULE=$SCOPE_PARTS[2]
+  SCOPE_VERSION=${SCOPE_PARTS[3]:-_}
+}
+
+# parse_scope_prefix <org>[/<module>[/<version>]] (for list): sets SCOPE_DEPTH
+# to the number of segments given; omitted segments stay empty, with no
+# default version.
+parse_scope_prefix() {
+  split_scope "$1" 1 3
+  validate_scope_parts
+  SCOPE_DEPTH=${#SCOPE_PARTS}
+  SCOPE_ORG=$SCOPE_PARTS[1]
+  SCOPE_MODULE=${SCOPE_PARTS[2]-}
+  SCOPE_VERSION=${SCOPE_PARTS[3]-}
+}
+
+# ---- Value validation ------------------------------------------------------
+# A value is a single line of valid UTF-8 with no NUL byte. macOS iconv accepts
+# NUL and code points above U+10FFFF, so those get their own checks (plan 1.3).
+
+readonly UTF8_RANGE_RE=$'\xf4[\x90-\xbf]|[\xf5-\xff]'
+
+# validate_value_string <value> [<subject>]: for a value from argv or stdin, or
+# bytes already read from a stored file. <subject> names what failed in
+# diagnostics (default "value"); the value itself is never included. Every check
+# runs on this one in-memory copy, so a concurrent atomic replace of a file can
+# never make the checks and the returned bytes disagree.
+validate_value_string() {
+  local value=$1 subject=${2:-value}
+  local -a statuses
+  [[ $value != *$'\0'* ]] || value_fail "$subject contains a NUL byte"
+  [[ $value != *[$'\r\n']* ]] || value_fail "$subject must be a single line (no line breaks)"
+  print -rn -- "$value" | /usr/bin/iconv -f UTF-8 -t UTF-8 > /dev/null 2>&1 ||
+    value_fail "$subject is not valid UTF-8"
+  # Read to EOF (no -q) so print can never die of SIGPIPE and hide a match.
+  print -rn -- "$value" | /usr/bin/grep -a -E "$UTF8_RANGE_RE" > /dev/null 2>&1
+  statuses=("${pipestatus[@]}")
+  case ${statuses[2]} in
+    0) value_fail "$subject is not valid UTF-8 (code point above U+10FFFF)" ;;
+    1) ;;
+    *) io_fail "could not validate $subject" ;;
+  esac
+}
+
+# strip_trailing_crlf: removes the whole trailing run of CR and LF characters
+# from REPLY in a single operation.
+strip_trailing_crlf() {
+  setopt local_options extendedglob
+  REPLY=${REPLY%%[$'\r\n']##}
+}
+
+# validate_value_file <file> <label>: reads a stored value file once, then sets
+# REPLY to its contents with every trailing CR/LF removed (plan D10) after
+# validating exactly those bytes. Any CR or LF left inside the value is a
+# failure (plan D3), never a truncation. <label> names the scope/variable in
+# diagnostics; contents are never printed. Returns 1 (REPLY empty) if the file
+# has vanished since it was found (a concurrent unset); any other read failure
+# is exit 3.
+validate_value_file() {
+  local file=$1 label=$2
+  local -i attempt
+  REPLY=''
+  for attempt in 1 2 3; do
+    if [[ -f $file && -r $file ]] && REPLY=$(<"$file"); then
+      strip_trailing_crlf
+      validate_value_string "$REPLY" "'$label'"
+      return 0
+    fi
+    REPLY=''
+    # Unreadable right now: gone for good, or just replaced under us.
+    path_is_absent "$file" && return 1
+  done
+  io_fail "cannot read '$label'"
+}
+
+# ---- Registry root ---------------------------------------------------------
+
+typeset -g REGISTRY_ROOT=''
+
+# registry_root: sets REGISTRY_ROOT. EVAR_HOME is the root itself (plan D11);
+# otherwise ${XDG_CONFIG_HOME:-$HOME/.config}/evar/registry. Empty values count
+# as unset and a relative path is an error, so the registry never silently
+# lands under the caller's working directory. Creates nothing.
+registry_root() {
+  local root
+  if [[ -n ${EVAR_HOME-} ]]; then
+    root=$EVAR_HOME
+  elif [[ -n ${XDG_CONFIG_HOME-} ]]; then
+    root=$XDG_CONFIG_HOME/evar/registry
+  elif [[ -n ${HOME-} ]]; then
+    root=$HOME/.config/evar/registry
+  else
+    usage_fail "cannot determine the registry root; set EVAR_HOME to an absolute path"
+  fi
+  [[ $root == /* ]] ||
+    usage_fail "the registry root must be an absolute path, got ${(qq)root} (check EVAR_HOME and XDG_CONFIG_HOME)"
+  while [[ $root == */ ]]; do
+    root=${root%/}
+  done
+  [[ -n $root ]] || usage_fail "the registry root must not be the filesystem root"
+  REGISTRY_ROOT=$root
+}
+
+# ---- Safe path layer -------------------------------------------------------
+# Every registry entry is looked up by exact-case name from a directory
+# listing (plan D7), and checked with stat-style tests that never follow or
+# open it. A symlink or wrong file type is exit 3, never "missing" (plan D3).
+
+typeset -g FOUND_PATH='' CASE_CONFLICT='' RESOLVED_PATH='' MISSING_SEGMENT=''
+typeset -g REL_NAME='' ENTRY_KIND=''
+typeset -gi RESOLVED_COUNT=0
+
+# rel_name <path>: sets REL_NAME to the registry-relative name used in
+# diagnostics.
+rel_name() {
+  if [[ -n $REGISTRY_ROOT && $1 == "$REGISTRY_ROOT"/* ]]; then
+    REL_NAME=${1#"$REGISTRY_ROOT"/}
+  else
+    REL_NAME=$1
+  fi
+}
+
+# path_is_absent <path>: succeeds only when the path certainly does not exist.
+# A path below an unsearchable directory is "cannot tell", not "absent".
+path_is_absent() {
+  local p=$1
+  [[ -e $p || -L $p ]] && return 1
+  p=${p:h}
+  while [[ $p != / && ! -e $p && ! -L $p ]]; do
+    p=${p:h}
+  done
+  [[ -d $p && -x $p ]]
+}
+
+# kind_once <path>: one classification pass; sets KIND_ONCE to symlink, dir,
+# file, other or none (nothing there).
+kind_once() {
+  if [[ -L $1 ]]; then
+    KIND_ONCE=symlink
+  elif [[ -d $1 ]]; then
+    KIND_ONCE=dir
+  elif [[ -f $1 ]]; then
+    KIND_ONCE=file
+  elif [[ -e $1 ]]; then
+    KIND_ONCE=other
+  else
+    KIND_ONCE=none
+  fi
+}
+
+# entry_kind <path>: sets ENTRY_KIND to symlink, dir, file, other, missing or
+# unknown (cannot tell). The tests in kind_once are separate system calls, so
+# an entry created or removed by a concurrent evar between two of them could be
+# misread (for example a new directory seen as "other"). A result is therefore
+# only accepted when two consecutive passes agree.
+typeset -g KIND_ONCE=''
+
+entry_kind() {
+  local first
+  local -i attempt
+  for attempt in 1 2 3; do
+    kind_once "$1"
+    first=$KIND_ONCE
+    kind_once "$1"
+    [[ $first == "$KIND_ONCE" ]] || continue
+    if [[ $first != none ]]; then
+      ENTRY_KIND=$first
+      return 0
+    fi
+    if path_is_absent "$1"; then
+      ENTRY_KIND=missing
+      return 0
+    fi
+  done
+  ENTRY_KIND=unknown
+}
+
+# require_kind <path> <dir|file>: exit 3 unless the existing entry is a real
+# directory / regular file. Returns 1 if the entry has vanished since it was
+# listed (a concurrent unset): that is "missing", not an I/O error.
+require_kind() {
+  local path=$1 want=$2 expected='regular file'
+  [[ $want == dir ]] && expected=directory
+  entry_kind "$path"
+  rel_name "$path"
+  case $ENTRY_KIND in
+    missing) return 1 ;;
+    symlink) io_fail "refusing symlinked registry entry '$REL_NAME'" ;;
+    $want) return 0 ;;
+    *) io_fail "registry entry '$REL_NAME' is not a $expected" ;;
+  esac
+}
+
+# check_registry_root: succeeds if the root is a usable directory, returns 1 if
+# it does not exist yet; exits 3 if it is a symlink or not a directory.
+check_registry_root() {
+  entry_kind "$REGISTRY_ROOT"
+  case $ENTRY_KIND in
+    dir) return 0 ;;
+    missing) return 1 ;;
+    symlink) io_fail "refusing symlinked registry root ${(qq)REGISTRY_ROOT}; set EVAR_HOME to the real directory" ;;
+    *) io_fail "registry root ${(qq)REGISTRY_ROOT} is not an accessible directory" ;;
+  esac
+}
+
+# list_dir <dir>: sets DIR_ENTRIES to the names of <dir>'s visible entries,
+# sorted bytewise. A directory that has vanished (a concurrent unset) lists as
+# empty; one that exists but cannot be read is exit 3, never "empty". Hidden
+# entries are skipped; valid identifiers never start with ".".
+typeset -ga DIR_ENTRIES
+
+# dir_read_failed <dir>: succeeds if listing <dir> fails. A glob cannot report a
+# read error (an unreadable directory simply matches nothing), so an apparently
+# empty directory is confirmed with ls before it is believed to be empty.
+dir_read_failed() {
+  ! /bin/ls -A -- "$1" > /dev/null 2>&1
+}
+
+list_dir() {
+  local entry
+  local -a paths
+  local -i attempt
+  DIR_ENTRIES=()
+  for attempt in 1 2 3; do
+    if [[ -d $1 && -r $1 && -x $1 ]]; then
+      paths=("$1"/*(Non))
+      if (( ${#paths} == 0 )) && dir_read_failed "$1"; then
+        path_is_absent "$1" && return 0
+        continue
+      fi
+      for entry in "${paths[@]}"; do
+        DIR_ENTRIES+=("${entry:t}")
+      done
+      return 0
+    fi
+    # Not readable right now: gone for good, or just created/removed under us.
+    path_is_absent "$1" && return 0
+  done
+  rel_name "$1"
+  io_fail "cannot read registry directory '$REL_NAME'"
+}
+
+# find_entry <dir> <name>: exact-case lookup of <name> among <dir>'s entries.
+# Returns 0 and sets FOUND_PATH if present; returns 1 if absent. A name that
+# differs only by case counts as absent but is reported in CASE_CONFLICT, so
+# the registry behaves the same on case-insensitive and case-sensitive disks.
+find_entry() {
+  local dir=$1 name=$2 entry
+  FOUND_PATH='' CASE_CONFLICT=''
+  list_dir "$dir"
+  for entry in "${DIR_ENTRIES[@]}"; do
+    if [[ $entry == "$name" ]]; then
+      FOUND_PATH=$dir/$entry
+      CASE_CONFLICT=''
+      return 0
+    elif [[ ${(L)entry} == ${(L)name} ]]; then
+      CASE_CONFLICT=$entry
+    fi
+  done
+  return 1
+}
+
+# resolve_chain <dir|file> <segment>...: walks REGISTRY_ROOT one exact-case
+# segment at a time; the last segment must be of the given kind, the rest
+# directories. Read-only. Returns 0 if every segment exists. Returns 1 at the
+# first missing segment (or an absent root), leaving RESOLVED_COUNT,
+# RESOLVED_PATH (deepest existing entry), MISSING_SEGMENT and CASE_CONFLICT.
+# Unsafe or unreadable entries exit 3.
+resolve_chain() {
+  local leaf_kind=$1 seg want
+  shift
+  local -i i=0 total=$#
+  FOUND_PATH='' CASE_CONFLICT='' MISSING_SEGMENT=''
+  RESOLVED_COUNT=0
+  RESOLVED_PATH=$REGISTRY_ROOT
+  check_registry_root || return 1
+  for seg in "$@"; do
+    (( ++i ))
+    if ! find_entry "$RESOLVED_PATH" "$seg"; then
+      MISSING_SEGMENT=$seg
+      return 1
+    fi
+    want=dir
+    (( i == total )) && want=$leaf_kind
+    if ! require_kind "$FOUND_PATH" "$want"; then
+      MISSING_SEGMENT=$seg
+      return 1
+    fi
+    RESOLVED_PATH=$FOUND_PATH
+    RESOLVED_COUNT=$i
+  done
+  return 0
+}
+
+# ensure_private_dir <dir>: make <dir> exist, mode 0700 (via the process umask)
+# for it and any missing parents. An existing directory is left untouched.
+typeset -ga CREATED_DIRS
+
+ensure_private_dir() {
+  local dir=$1
+  entry_kind "$dir"
+  rel_name "$dir"
+  case $ENTRY_KIND in
+    dir) return 0 ;;
+    symlink) io_fail "refusing symlinked directory '$REL_NAME'" ;;
+    missing) ;;
+    *) io_fail "'$REL_NAME' exists but is not a directory" ;;
+  esac
+  if /bin/mkdir -p -- "$dir" 2> /dev/null; then
+    CREATED_DIRS+=("$dir")
+  else
+    # Another process may have created it between the check and mkdir.
+    entry_kind "$dir"
+    [[ $ENTRY_KIND == dir ]] || io_fail "cannot create directory '$REL_NAME'"
+  fi
+}
+
+# ensure_scope_dirs <org> <module> <version>: create the registry root and each
+# scope level one at a time, so nothing is ever created through a symlink. The
+# directories actually created are listed in CREATED_DIRS so a write that is
+# rejected afterwards can remove them (undo_created_dirs). Callers resolve
+# exact-case conflicts first (resolve_chain).
+ensure_scope_dirs() {
+  CREATED_DIRS=()
+  ensure_private_dir "$REGISTRY_ROOT"
+  ensure_private_dir "$REGISTRY_ROOT/$1"
+  ensure_private_dir "$REGISTRY_ROOT/$1/$2"
+  ensure_private_dir "$REGISTRY_ROOT/$1/$2/$3"
+}
+
+# undo_created_dirs: best-effort removal, deepest first, of the directories
+# ensure_scope_dirs created. rmdir only removes empty directories, so anything
+# another writer has since put there is left alone.
+undo_created_dirs() {
+  local -i i
+  for (( i = ${#CREATED_DIRS}; i >= 1; i-- )); do
+    /bin/rmdir -- "$CREATED_DIRS[i]" 2> /dev/null
+  done
+  CREATED_DIRS=()
+}
+
+# ---- Primitives ------------------------------------------------------------
+# Each takes the scope identity (<org> <module> <version> [<VAR>]) and
+# re-verifies the whole registry path itself (exact case, no symlinks), so it
+# is safe to call on its own. The stored value is only ever read as bytes and
+# printed with print -r; it is never evaluated.
+
+# read_var_file <org> <module> <version> <VAR>: returns 0 with the value in
+# REPLY, or 1 (REPLY empty) if the variable does not exist. Corrupt content is
+# exit 2; unsafe or unreadable entries are exit 3.
+read_var_file() {
+  local label=$1/$2/$3/$4
+  REPLY=''
+  resolve_chain file "$1" "$2" "$3" "$4" || return 1
+  validate_value_file "$RESOLVED_PATH" "$label"
+}
+
+# delete_var_file <org> <module> <version> <VAR>: returns 0 if it deleted the
+# file, 1 if there was none.
+delete_var_file() {
+  resolve_chain file "$1" "$2" "$3" "$4" || return 1
+  if ! /bin/rm -- "$RESOLVED_PATH" 2> /dev/null; then
+    # A concurrent unset may have removed it first.
+    entry_kind "$RESOLVED_PATH"
+    [[ $ENTRY_KIND == missing ]] && return 1
+    io_fail "cannot delete '$1/$2/$3/$4'"
+  fi
+}
+
+# dir_is_empty <dir>: succeeds if the directory holds nothing, hidden entries
+# (such as .DS_Store) included.
+dir_is_empty() {
+  local -a entries
+  entries=("$1"/*(DN))
+  (( ${#entries} == 0 ))
+}
+
+# prune_empty_dirs <org> <module> <version>: remove the version, module and org
+# directories, in that order, stopping at the first one that is not empty. The
+# registry root is never removed.
+prune_empty_dirs() {
+  local dir
+  resolve_chain dir "$1" "$2" "$3" || return 0
+  for dir in "$REGISTRY_ROOT/$1/$2/$3" "$REGISTRY_ROOT/$1/$2" "$REGISTRY_ROOT/$1"; do
+    dir_is_empty "$dir" || return 0
+    if ! /bin/rmdir -- "$dir" 2> /dev/null; then
+      # Stop quietly only if a concurrent unset already removed it or a
+      # concurrent set refilled it; anything else is a real failure.
+      entry_kind "$dir"
+      [[ $ENTRY_KIND == missing ]] && return 0
+      if [[ $ENTRY_KIND == dir ]] && ! dir_is_empty "$dir"; then
+        return 0
+      fi
+      rel_name "$dir"
+      io_fail "cannot remove empty directory '$REL_NAME'"
+    fi
+  done
+}
+
+# discard_temp_file <path>: remove a temp file; it is forgotten only once it is
+# really gone, so the exit trap still retries a failed removal.
+discard_temp_file() {
+  /bin/rm -f -- "$1" 2> /dev/null && EVAR_TEMP_FILES=()
+}
+
+# write_var_file <org> <module> <version> <VAR> <value>: atomically store
+# "<value>\n" (mode 0600) via a hidden mktemp file in the target directory and
+# mv -f. The caller validates the value; the single-line check here is only a
+# backstop that fires before any filesystem change. Names that differ from an
+# existing sibling only by case are a usage error (plan D7), checked before
+# anything is created and again afterwards, because on a case-insensitive disk
+# mkdir silently reuses a case-variant created by a concurrent writer. If the
+# scope directory disappears under a concurrent unset, the write is retried once.
+write_var_file() {
+  local org=$1 module=$2 version=$3 var=$4 value=$5
+  local label=$org/$module/$version/$var dir tmp
+  local -i attempt
+  [[ $value != *[$'\r\n']* ]] || value_fail "value must be a single line (no line breaks)"
+  for attempt in 1 2; do
+    if ! resolve_chain file "$org" "$module" "$version" "$var" && [[ -n $CASE_CONFLICT ]]; then
+      usage_fail "cannot create ${(qq)MISSING_SEGMENT}: ${(qq)CASE_CONFLICT} already exists and names may not differ only by case"
+    fi
+    ensure_scope_dirs "$org" "$module" "$version"
+    if ! resolve_chain dir "$org" "$module" "$version"; then
+      if [[ -n $CASE_CONFLICT ]]; then
+        undo_created_dirs
+        usage_fail "cannot create ${(qq)MISSING_SEGMENT}: ${(qq)CASE_CONFLICT} already exists and names may not differ only by case"
+      fi
+      continue
+    fi
+    dir=$REGISTRY_ROOT/$org/$module/$version
+    # Signal handlers are armed only around the temp file's life (they are
+    # function-local and undone on return); elsewhere the default action
+    # applies, because a trap would be deferred behind a blocking read. They
+    # are armed before mktemp, and its output is registered in the same
+    # statement, so a signal cannot slip in between creation and registration.
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    EVAR_TEMP_FILES=("$(/usr/bin/mktemp "$dir/.evar-write.XXXXXX" 2> /dev/null)")
+    tmp=${EVAR_TEMP_FILES[1]}
+    if [[ -z $tmp ]]; then
+      EVAR_TEMP_FILES=()
+      [[ -d $dir ]] && io_fail "cannot create a temporary file for '$label'"
+      continue
+    fi
+    if ! emit "$value"$'\n' 2> /dev/null > "$tmp"; then
+      discard_temp_file "$tmp"
+      io_fail "cannot write '$label'"
+    fi
+    if /bin/mv -f -- "$tmp" "$dir/$var" 2> /dev/null; then
+      EVAR_TEMP_FILES=()
+      trap - HUP INT TERM
+      return 0
+    fi
+    discard_temp_file "$tmp"
+    [[ -d $dir ]] && io_fail "cannot replace '$label'"
+  done
+  io_fail "the scope directory for '$label' kept disappearing; try again"
+}
+
+# ---- Commands --------------------------------------------------------------
+
+# read_stdin_value: sets REPLY to exactly one line from standard input, ended by
+# LF, CRLF or end of input (plan D4). Zero bytes is an error, so a failed
+# upstream command cannot silently store an empty value; send a lone newline
+# for an intentional empty value. Anything else left over (a second line, a
+# bare CR) is rejected later by validate_value_string, never truncated.
+# Reading happens in this process (no cat or subshell child), so a signal ends
+# evar immediately and nothing is left running.
+read_stdin_value() {
+  local data=''
+  local -i rc
+  { : <&0 } 2> /dev/null || io_fail "cannot read standard input"
+  # With an empty delimiter read consumes everything up to EOF (status 1) and
+  # keeps newlines and CRs; status 0 means it stopped at a NUL byte.
+  IFS= read -r -d '' data
+  rc=$?
+  (( rc == 0 )) && value_fail "value contains a NUL byte"
+  [[ -n $data ]] || value_fail "no input on standard input (send a lone newline to store an empty value)"
+  if [[ $data == *$'\r\n' ]]; then
+    data=${data%$'\r\n'}
+  else
+    data=${data%$'\n'}
+  fi
+  REPLY=$data
+}
+
+# evar set [--] <scope> <VAR> <VALUE> | evar set <scope> <VAR> --stdin
+cmd_set() {
+  local value
+  parse_args set stdin "$@"
+  if (( OPT_STDIN )); then
+    (( ${#ARGS} >= 2 )) || usage_fail "expected: evar set <org>/<module>[/<version>] <VAR> --stdin"
+    (( ${#ARGS} == 2 )) || usage_fail "--stdin cannot be combined with a VALUE argument"
+  else
+    (( ${#ARGS} >= 3 )) || usage_fail "missing VALUE; expected: evar set <org>/<module>[/<version>] <VAR> <VALUE> (or use --stdin)"
+    (( ${#ARGS} == 3 )) || usage_fail "unexpected argument ${(qq)ARGS[4]}"
+  fi
+  parse_scope "$ARGS[1]"
+  require_variable "$ARGS[2]"
+  if (( OPT_STDIN )); then
+    read_stdin_value
+    value=$REPLY
+  else
+    value=$ARGS[3]
+  fi
+  validate_value_string "$value"
+  registry_root
+  write_var_file "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" "$ARGS[2]" "$value"
+}
+
+# missing_fail <label>: exit 1 for a scope or variable that does not exist. If a
+# name differing only by case exists, say so (plan D7).
+missing_fail() {
+  local hint=''
+  [[ -n $CASE_CONFLICT ]] && hint=" (${(qq)CASE_CONFLICT} exists, but names must match case exactly)"
+  fail 1 "not found: $1$hint"
+}
+
+# scope_has_variable <scope dir>: succeeds if the directory holds at least one
+# valid variable file. Only names matching the variable grammar count (hidden
+# files, *.tmp and other junk are ignored), but every matching entry must be a
+# regular file, whatever its position: a symlink or other type is exit 3.
+# Contents are not read.
+scope_has_variable() {
+  local name found=1
+  local -a names
+  list_dir "$1"
+  names=("${DIR_ENTRIES[@]}")
+  for name in "${names[@]}"; do
+    valid_variable "$name" || continue
+    require_kind "$1/$name" file || continue
+    found=0
+  done
+  return $found
+}
+
+# evar exists [--] <scope> [<VAR>]: silent; the exit status is the answer.
+cmd_exists() {
+  parse_args exists '' "$@"
+  (( ${#ARGS} >= 1 && ${#ARGS} <= 2 )) ||
+    usage_fail "expected: evar exists <org>/<module>[/<version>] [<VAR>]"
+  parse_scope "$ARGS[1]"
+  if (( ${#ARGS} == 2 )); then
+    require_variable "$ARGS[2]"
+  fi
+  registry_root
+  if (( ${#ARGS} == 2 )); then
+    resolve_chain file "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" "$ARGS[2]"
+  else
+    resolve_chain dir "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" && scope_has_variable "$RESOLVED_PATH"
+  fi
+}
+
+# ---- list ------------------------------------------------------------------
+# Enumeration considers only entries whose names match the identifier grammar;
+# everything else (.DS_Store, *.tmp, hidden temp files, stray names) is ignored.
+# A matching entry that is a symlink or the wrong type is exit 3. Results are
+# buffered in LIST_LINES so a failure never leaves partial output.
+
+typeset -ga LIST_LINES
+
+collect_versions() { # <org> <module>
+  local version
+  local -a versions
+  list_dir "$REGISTRY_ROOT/$1/$2"
+  versions=("${DIR_ENTRIES[@]}")
+  for version in "${versions[@]}"; do
+    valid_version "$version" || continue
+    require_kind "$REGISTRY_ROOT/$1/$2/$version" dir || continue
+    if scope_has_variable "$REGISTRY_ROOT/$1/$2/$version"; then
+      LIST_LINES+=("$1/$2/$version")
+    fi
+  done
+}
+
+collect_modules() { # <org>
+  local module
+  local -a modules
+  list_dir "$REGISTRY_ROOT/$1"
+  modules=("${DIR_ENTRIES[@]}")
+  for module in "${modules[@]}"; do
+    valid_org_like "$module" || continue
+    require_kind "$REGISTRY_ROOT/$1/$module" dir || continue
+    collect_versions "$1" "$module"
+  done
+}
+
+collect_orgs() {
+  local org
+  local -a orgs
+  list_dir "$REGISTRY_ROOT"
+  orgs=("${DIR_ENTRIES[@]}")
+  for org in "${orgs[@]}"; do
+    valid_org_like "$org" || continue
+    require_kind "$REGISTRY_ROOT/$org" dir || continue
+    collect_modules "$org"
+  done
+}
+
+# collect_vars <org> <module> <version>: NAME=VALUE lines in variable-name order.
+collect_vars() {
+  local dir=$REGISTRY_ROOT/$1/$2/$3 name
+  local -a names
+  list_dir "$dir"
+  names=("${DIR_ENTRIES[@]}")
+  for name in "${names[@]}"; do
+    valid_variable "$name" || continue
+    require_kind "$dir/$name" file || continue
+    validate_value_file "$dir/$name" "$1/$2/$3/$name" || continue
+    LIST_LINES+=("$name=$REPLY")
+  done
+}
+
+print_list_lines() {
+  (( ${#LIST_LINES} )) && out_line "${(F)LIST_LINES}"
+  return 0
+}
+
+# evar list [--] [<org>[/<module>[/<version>]]]
+cmd_list() {
+  local label
+  parse_args list '' "$@"
+  (( ${#ARGS} <= 1 )) || usage_fail "expected: evar list [<org>[/<module>[/<version>]]]"
+  LIST_LINES=()
+  if (( ${#ARGS} == 0 )); then
+    registry_root
+    if check_registry_root; then
+      collect_orgs
+      LIST_LINES=("${(@o)LIST_LINES}")
+    fi
+    print_list_lines
+    return 0
+  fi
+  parse_scope_prefix "$ARGS[1]"
+  registry_root
+  case $SCOPE_DEPTH in
+    1)
+      label=$SCOPE_ORG
+      resolve_chain dir "$SCOPE_ORG" || missing_fail "$label"
+      collect_modules "$SCOPE_ORG"
+      LIST_LINES=("${(@o)LIST_LINES}")
+      ;;
+    2)
+      label=$SCOPE_ORG/$SCOPE_MODULE
+      resolve_chain dir "$SCOPE_ORG" "$SCOPE_MODULE" || missing_fail "$label"
+      collect_versions "$SCOPE_ORG" "$SCOPE_MODULE"
+      LIST_LINES=("${(@o)LIST_LINES}")
+      ;;
+    3)
+      label=$SCOPE_ORG/$SCOPE_MODULE/$SCOPE_VERSION
+      resolve_chain dir "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" || missing_fail "$label"
+      collect_vars "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION"
+      ;;
+  esac
+  (( ${#LIST_LINES} )) || fail 1 "no variables found under '$label'"
+  print_list_lines
+}
+
+# evar unset [-f|--force] [--] <scope> <VAR>
+cmd_unset() {
+  parse_args unset force "$@"
+  (( ${#ARGS} == 2 )) ||
+    usage_fail "expected: evar unset [-f|--force] <org>/<module>[/<version>] <VAR>"
+  parse_scope "$ARGS[1]"
+  require_variable "$ARGS[2]"
+  registry_root
+  if delete_var_file "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" "$ARGS[2]"; then
+    prune_empty_dirs "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION"
+    return 0
+  fi
+  (( OPT_FORCE )) && return 0
+  missing_fail "$SCOPE_ORG/$SCOPE_MODULE/$SCOPE_VERSION/$ARGS[2]"
+}
+
+# evar get [-n|--no-newline] [--] <scope> <VAR>
+cmd_get() {
+  parse_args get no-newline "$@"
+  (( ${#ARGS} == 2 )) || usage_fail "expected: evar get [-n|--no-newline] <org>/<module>[/<version>] <VAR>"
+  parse_scope "$ARGS[1]"
+  require_variable "$ARGS[2]"
+  registry_root
+  read_var_file "$SCOPE_ORG" "$SCOPE_MODULE" "$SCOPE_VERSION" "$ARGS[2]" ||
+    missing_fail "$SCOPE_ORG/$SCOPE_MODULE/$SCOPE_VERSION/$ARGS[2]"
+  if (( OPT_NO_NEWLINE )); then
+    out "$REPLY"
+  else
+    out_line "$REPLY"
+  fi
+}
+
+# ---- Main ------------------------------------------------------------------
+
+main() {
+  if (( $# == 0 )); then
+    usage
+    return 0
+  fi
+  case $1 in
+    -h|--help|help)
+      (( $# == 1 )) || usage_fail "unexpected argument ${(qq)2}; use --help"
+      usage
+      ;;
+    -V|--version)
+      (( $# == 1 )) || usage_fail "unexpected argument ${(qq)2}; use --help"
+      out_line "evar $EVAR_VERSION"
+      ;;
+    set)
+      cmd_set "${@:2}"
+      ;;
+    get)
+      cmd_get "${@:2}"
+      ;;
+    exists)
+      cmd_exists "${@:2}"
+      ;;
+    unset)
+      cmd_unset "${@:2}"
+      ;;
+    list)
+      cmd_list "${@:2}"
+      ;;
+    -*)
+      usage_fail "unknown option ${(qq)1}; use --help"
+      ;;
+    *)
+      usage_fail "unknown command ${(qq)1}; use --help"
+      ;;
+  esac
+}
+
+# When sourced (the test suites do this to exercise individual functions),
+# define the functions and stop; only a direct run executes main.
+if [[ $ZSH_EVAL_CONTEXT == *:file ]]; then
+  return 0
+fi
+
+trap cleanup_temp_files EXIT
+
+main "$@"
+exit $?
